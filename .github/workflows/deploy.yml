@@ -1,0 +1,131 @@
+name: Deploy n8n to Oracle with Docker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docker-compose.yml"
+      - "Caddyfile"
+      - ".env.example"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: n8n-deploy
+  cancel-in-progress: true
+
+jobs:
+  validate-compose:
+    name: Validate Docker Compose
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate compose file
+        run: |
+          N8N_ENV_FILE=.env.example docker compose --env-file .env.example config
+
+      - name: Validate compose with secrets
+        env:
+          N8N_ENCRYPTION_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
+          N8N_HOST: ${{ secrets.N8N_HOST }}
+        run: |
+          if [ -z "$N8N_ENCRYPTION_KEY" ]; then
+            echo "Missing GitHub Secret: N8N_ENCRYPTION_KEY"
+            exit 1
+          fi
+          export N8N_HOST="${N8N_HOST:-localhost}"
+          export N8N_PROTOCOL=http
+          export N8N_BIND_IP=0.0.0.0
+          export N8N_PORT_PUBLIC=5678
+          export WEBHOOK_URL="http://${N8N_HOST}:5678/"
+          export N8N_SECURE_COOKIE=false
+          export COMPOSE_PROFILES=""
+          envsubst < .env.example > .env
+          docker compose --env-file .env config
+          rm -f .env
+
+  deploy:
+    name: Deploy to server
+    runs-on: ubuntu-latest
+    needs: validate-compose
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          N8N_ENCRYPTION_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
+          N8N_HOST: ${{ secrets.N8N_HOST }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER || 'ubuntu' }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          envs: N8N_ENCRYPTION_KEY,N8N_HOST
+          script: |
+            set -eu
+
+            APP_DIR="$HOME/n8n"
+
+            REPO_URL="https://github.com/${{ github.repository }}.git"
+            BRANCH="${{ github.ref_name }}"
+
+            if ! command -v git >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y git
+            fi
+
+            command -v docker >/dev/null 2>&1
+            docker compose version >/dev/null 2>&1
+
+            DOCKER_COMPOSE="docker compose"
+            if ! docker ps >/dev/null 2>&1; then
+              DOCKER_COMPOSE="sudo docker compose"
+            fi
+
+            if ! command -v envsubst >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y gettext-base
+            fi
+
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
+
+            if [ ! -d .git ]; then
+              git init
+              git remote add origin "$REPO_URL"
+            fi
+
+            git fetch --depth=1 origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+
+            if echo "$N8N_HOST" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+              export N8N_PROTOCOL="http"
+              export N8N_BIND_IP="0.0.0.0"
+              export N8N_PORT_PUBLIC="5678"
+              export WEBHOOK_URL="http://${N8N_HOST}:5678/"
+              export N8N_SECURE_COOKIE="false"
+              export COMPOSE_PROFILES=""
+            else
+              export N8N_PROTOCOL="https"
+              export N8N_BIND_IP="127.0.0.1"
+              export N8N_PORT_PUBLIC="5678"
+              export WEBHOOK_URL="https://${N8N_HOST}/"
+              export N8N_SECURE_COOKIE="true"
+              export COMPOSE_PROFILES="https"
+            fi
+
+            envsubst < .env.example > .env
+            chmod 600 .env
+
+            KEY_VAL="$(grep '^N8N_ENCRYPTION_KEY=' .env | cut -d= -f2-)"
+            if [ -z "$KEY_VAL" ] || [ "$(printf '%s' "$KEY_VAL" | wc -c)" -ne 64 ]; then
+              echo "N8N_ENCRYPTION_KEY is missing or not a 64-char hex string. Check the secret value."
+              exit 1
+            fi
+
+            $DOCKER_COMPOSE --env-file .env config >/dev/null
+            $DOCKER_COMPOSE pull
+            $DOCKER_COMPOSE up -d --remove-orphans
+            $DOCKER_COMPOSE ps
